@@ -25,3 +25,4 @@ An intelligent virtual receptionist system that connects homeowners with service
 3. Start the server: `npm start`
 
 ## Environment Variables Required
+see .env file
