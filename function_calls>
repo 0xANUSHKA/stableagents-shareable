@@ -1,0 +1,119 @@
+require('dotenv').config();
+require('colors');
+
+const express = require('express');
+const ExpressWs = require('express-ws');
+
+const { GptService } = require('./services/gpt-service');
+const { StreamService } = require('./services/stream-service');
+const { TranscriptionService } = require('./services/transcription-service');
+const { TextToSpeechService } = require('./services/tts-service');
+const { recordingService } = require('./services/recording-service');
+
+const VoiceResponse = require('twilio').twiml.VoiceResponse;
+
+const app = express();
+ExpressWs(app);
+
+const PORT = process.env.PORT || 3000;
+
+// Constants
+const MIN_SPEECH_LENGTH = 5;
+const ACKNOWLEDGMENTS = ["Got it.", "Okay.", "I understand."];
+
+app.post('/incoming', (req, res) => {
+  const response = new VoiceResponse();
+  const connect = response.connect();
+  connect.stream({ url: `wss://${process.env.SERVER}/connection` });
+  res.type('text/xml');
+  res.end(response.toString());
+});
+
+app.ws('/connection', (ws) => {
+  let streamSid;
+  let callSid;
+  let lastProcessedText = '';
+  let processingResponse = false;
+
+  const gptService = new GptService();
+  const streamService = new StreamService(ws);
+  const transcriptionService = new TranscriptionService();
+  const ttsService = new TextToSpeechService({});
+  
+  let marks = [];
+  let interactionCount = 0;
+
+  ws.on('message', function message(data) {
+    const msg = JSON.parse(data);
+    
+    if (msg.event === 'start') {
+      streamSid = msg.start.streamSid;
+      callSid = msg.start.callSid;
+      
+      streamService.setStreamSid(streamSid);
+      gptService.setCallSid(callSid);
+      
+      // Initial greeting
+      ttsService.generate({
+        partialResponseIndex: null,
+        partialResponse: 'Hello! How can I help you with your home service needs today?'
+      }, 0);
+    } else if (msg.event === 'media') {
+      transcriptionService.send(msg.media.payload);
+    } else if (msg.event === 'mark') {
+      marks = marks.filter(m => m !== msg.mark.name);
+    }
+  });
+
+  transcriptionService.on('utterance', async (text) => {
+    if (text?.length >= MIN_SPEECH_LENGTH && marks.length > 0) {
+      ws.send(JSON.stringify({
+        streamSid,
+        event: 'clear',
+      }));
+    }
+  });
+
+  transcriptionService.on('transcription', async (text) => {
+    if (!text || text.length < MIN_SPEECH_LENGTH || processingResponse || text === lastProcessedText) {
+      return;
+    }
+
+    console.log(`User: ${text}`.yellow);
+    lastProcessedText = text;
+    processingResponse = true;
+
+    try {
+      // Quick acknowledgment
+      const acknowledgment = ACKNOWLEDGMENTS[Math.floor(Math.random() * ACKNOWLEDGMENTS.length)];
+      ttsService.generate({
+        partialResponseIndex: null,
+        partialResponse: acknowledgment
+      }, interactionCount);
+
+      // Process with GPT
+      await gptService.completion(text, interactionCount);
+      interactionCount++;
+    } catch (error) {
+      console.error('Error:', error);
+    } finally {
+      processingResponse = false;
+    }
+  });
+
+  gptService.on('gptreply', async (gptReply, icount) => {
+    console.log(`Assistant: ${gptReply.partialResponse}`.green);
+    ttsService.generate(gptReply, icount);
+  });
+
+  ttsService.on('speech', (responseIndex, audio, label, icount) => {
+    streamService.buffer(responseIndex, audio);
+  });
+
+  streamService.on('audiosent', (markLabel) => {
+    marks.push(markLabel);
+  });
+});
+
+app.listen(PORT);
+console.log(`Server running on port ${PORT}`);
